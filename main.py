@@ -6,7 +6,8 @@ import threading
 import concurrent.futures
 from datetime import datetime
 import requests
-import boto3
+
+from google_auth_oauthlib.flow import InstalledAppFlow
 
 # --- Utility Functions ---
 
@@ -17,76 +18,104 @@ def get_timestamp():
 def log(message, type="INFO"):
     print(f"[{get_timestamp()}] [{type}] {message}")
 
-# --- Configuration Loading ---
-
-def load_config():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(base_dir, "config.json")
-    # Default configuration (if you need to reauthenticate, these fields must be provided)
-    default_config = {
-        "cognito": {
-            "region": "ap-northeast-1",
-            "clientId": "5msns4n49hmg3dftp2tp1t2iuh",
-            "userPoolId": "ap-northeast-1_M22I44OpC",
-            "username": "",  # Your email (only needed for fallback auth)
-            "password": ""   # Your password (only needed for fallback auth)
-        },
-        "aws": {
-            "accessKeyId": "",        # Required for fallback admin authentication
-            "secretAccessKey": "",
-            "sessionToken": ""
-        },
-        "stork": {
-            "intervalSeconds": 10,
-            "baseURL": "https://app-api.jp.stork-oracle.network/v1",
-            "authURL": "https://api.jp.stork-oracle.network/auth",
-            "tokenPath": os.path.join(base_dir, "token.json"),
-            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-            "origin": "chrome-extension://knnliglhgkmlblppdejchidfihjnockl"
-        },
-        "threads": {
-            "maxWorkers": 10,
-            "proxyFile": os.path.join(base_dir, "proxies.txt")
-        }
-    }
-    if not os.path.exists(config_path):
-        log(f"Config file not found at {config_path}. Creating default config.", "WARN")
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(default_config, f, indent=2)
-        return default_config
-    else:
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                user_config = json.load(f)
-            log("Configuration loaded successfully from config.json")
-            return user_config
-        except Exception as e:
-            log(f"Error loading config: {str(e)}", "ERROR")
-            raise Exception("Failed to load configuration")
-
-user_config = load_config()
+# --- Configuration ---
 base_dir = os.path.dirname(os.path.abspath(__file__))
 config = {
-    "cognito": user_config.get("cognito", {}),
-    "aws": user_config.get("aws", {}),
-    "stork": user_config.get("stork", {}),
-    "threads": user_config.get("threads", {})
+    "google": {
+        # Path to your client_secret.json file (saved as described above)
+        "client_secrets_file": os.path.join(base_dir, "client_secret.json"),
+        # Scopes required to get the id_token (openid is required)
+        "scopes": ["openid", "email", "profile"]
+    },
+    "firebase": {
+        # Your Firebase Web API key from your Firebase project settings
+        "apiKey": "AIzaSyAGaegw8n_6MQAvB1CNLztXh4JYMf3bE5M"
+    },
+    "stork": {
+        "baseURL": "https://app-api.jp.stork-oracle.network/v1",
+        "authURL": "https://api.jp.stork-oracle.network/auth",
+        "intervalSeconds": 10,
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+        "origin": "chrome-extension://knnliglhgkmlblppdejchidfihjnockl"
+    },
+    "threads": {
+        "maxWorkers": 10,
+        "proxyFile": os.path.join(base_dir, "proxies.txt")
+    }
 }
 
-def validate_config():
-    token_path = config["stork"].get("tokenPath")
-    # If token.json exists, we use its tokens and do not require username/password or AWS creds.
-    if token_path and os.path.exists(token_path):
-        log(f"Using tokens from {token_path}")
-        return True
-    # Otherwise, fallback: ensure that username, password, and AWS credentials are provided.
-    if not config["cognito"].get("username") or not config["cognito"].get("password"):
-        log("ERROR: Username and password must be set in config.json", "ERROR")
-        return False
-    if not config["aws"].get("accessKeyId") or not config["aws"].get("secretAccessKey"):
-        log("ERROR: AWS credentials must be provided for fallback authentication.", "ERROR")
-        return False
-    return True
+# --- Google OAuth Flow ---
+
+class GoogleOAuth:
+    def __init__(self, client_secrets_file, scopes):
+        self.client_secrets_file = client_secrets_file
+        self.scopes = scopes
+
+    def get_google_id_token(self):
+        log("Starting Google OAuth flow. A browser window will open for authentication.")
+        flow = InstalledAppFlow.from_client_secrets_file(
+            self.client_secrets_file,
+            scopes=self.scopes
+        )
+        # Run a local server to complete the OAuth flow.
+        creds = flow.run_local_server(port=0)
+        if not hasattr(creds, "id_token") or creds.id_token is None:
+            raise Exception("Failed to obtain Google ID token")
+        log("Google OAuth authentication successful.")
+        return creds.id_token
+
+# --- Firebase Authentication via Google ---
+
+class FirebaseAuthGoogle:
+    def __init__(self, google_id_token, api_key):
+        self.google_id_token = google_id_token
+        self.api_key = api_key
+
+    def authenticate(self):
+        log("Authenticating with Firebase using Google OAuth token...")
+        url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key={self.api_key}"
+        payload = {
+            "postBody": f"id_token={self.google_id_token}&providerId=google.com",
+            "requestUri": "http://localhost",
+            "returnIdpCredential": True,
+            "returnSecureToken": True
+        }
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        expires_in = int(data.get("expiresIn", "3600")) * 1000  # Convert seconds to milliseconds
+        token_data = {
+            "accessToken": data["idToken"],
+            "idToken": data["idToken"],
+            "refreshToken": data["refreshToken"],
+            "expiresIn": expires_in
+        }
+        log("Firebase authentication via Google OAuth successful.")
+        return token_data
+
+# --- Token Management ---
+# This class uses GoogleOAuth to obtain a Google ID token and then exchanges it with Firebase.
+class TokenManager:
+    def __init__(self):
+        google_config = config["google"]
+        self.google_auth = GoogleOAuth(google_config["client_secrets_file"], google_config["scopes"])
+        self.firebase_auth = None
+        self.tokens = None
+        self.token_time = 0
+
+    def get_valid_token(self):
+        if self.tokens is None or self.is_token_expired():
+            google_id_token = self.google_auth.get_google_id_token()
+            self.firebase_auth = FirebaseAuthGoogle(google_id_token, config["firebase"]["apiKey"])
+            self.tokens = self.firebase_auth.authenticate()
+            self.token_time = int(time.time() * 1000)
+        return self.tokens["accessToken"]
+
+    def is_token_expired(self):
+        if self.tokens is None:
+            return True
+        current_time = int(time.time() * 1000)
+        return current_time >= (self.token_time + self.tokens["expiresIn"])
 
 # --- Proxy Loading ---
 
@@ -115,162 +144,17 @@ def get_proxy_dict(proxy):
         return {"http": proxy, "https": proxy}
     raise Exception(f"Unsupported proxy protocol: {proxy}")
 
-# --- Fallback AWS Cognito Authentication ---
-# This section is used only if token.json is missing.
-class CognitoAuth:
-    def __init__(self, username, password):
-        self.username = username
-        self.password = password
-        aws_config = config.get("aws", {})
-        self.client = boto3.client(
-            'cognito-idp',
-            region_name=config["cognito"].get("region", "ap-northeast-1"),
-            aws_access_key_id=aws_config.get("accessKeyId"),
-            aws_secret_access_key=aws_config.get("secretAccessKey"),
-            aws_session_token=aws_config.get("sessionToken") or None
-        )
-        self.client_id = config["cognito"].get("clientId")
-        self.user_pool_id = config["cognito"].get("userPoolId")
-
-    def authenticate(self):
-        try:
-            response = self.client.admin_initiate_auth(
-                UserPoolId=self.user_pool_id,
-                ClientId=self.client_id,
-                AuthFlow="ADMIN_NO_SRP_AUTH",
-                AuthParameters={
-                    "USERNAME": self.username,
-                    "PASSWORD": self.password
-                }
-            )
-            auth_result = response.get("AuthenticationResult")
-            if not auth_result:
-                raise Exception("Authentication failed, no result returned")
-            expires_in_ms = auth_result["ExpiresIn"] * 1000
-            token_data = {
-                "accessToken": auth_result["AccessToken"],
-                "idToken": auth_result["IdToken"],
-                "refreshToken": auth_result["RefreshToken"],
-                "expiresIn": expires_in_ms - int(time.time() * 1000)
-            }
-            return token_data
-        except Exception as e:
-            raise Exception("Authentication error: " + str(e))
-
-    def refresh_session(self, refresh_token):
-        try:
-            response = self.client.admin_initiate_auth(
-                UserPoolId=self.user_pool_id,
-                ClientId=self.client_id,
-                AuthFlow="REFRESH_TOKEN_AUTH",
-                AuthParameters={
-                    "USERNAME": self.username,
-                    "REFRESH_TOKEN": refresh_token
-                }
-            )
-            auth_result = response.get("AuthenticationResult")
-            if not auth_result:
-                raise Exception("Refresh session failed, no result returned")
-            expires_in_ms = auth_result["ExpiresIn"] * 1000
-            token_data = {
-                "accessToken": auth_result["AccessToken"],
-                "idToken": auth_result["IdToken"],
-                "refreshToken": refresh_token,
-                "expiresIn": expires_in_ms - int(time.time() * 1000)
-            }
-            return token_data
-        except Exception as e:
-            raise Exception("Refresh session error: " + str(e))
-
-# --- Token Management ---
-# In this design, we load tokens from token.json (which you create manually in the provided format).
-class TokenManager:
-    def __init__(self):
-        self.access_token = None
-        self.refresh_token = None
-        self.id_token = None
-        # For simplicity, set token expiration to 1 hour from load.
-        self.expires_at = int(time.time() * 1000) + 3600000
-        try:
-            tokens = get_tokens()
-            self.access_token = tokens.get("accessToken")
-            self.id_token = tokens.get("idToken")
-            self.refresh_token = tokens.get("refreshToken")
-            log("Loaded tokens from token.json")
-        except Exception as e:
-            log(f"Failed to load tokens: {str(e)}", "ERROR")
-            raise
-
-    def get_valid_token(self):
-        # In this version, we assume the provided tokens are valid.
-        if not self.access_token:
-            raise Exception("No access token available")
-        return self.access_token
-
-def get_tokens():
-    token_path = config["stork"].get("tokenPath")
-    if not token_path or not os.path.exists(token_path):
-        raise Exception(f"Token file not found at {token_path}")
-    try:
-        with open(token_path, "r", encoding="utf-8") as f:
-            tokens = json.load(f)
-        if not tokens.get("accessToken") or len(tokens.get("accessToken")) < 20:
-            raise Exception("Invalid access token")
-        log(f"Successfully read access token: {tokens['accessToken'][:10]}...")
-        return tokens
-    except Exception as e:
-        log(f"Error reading tokens: {str(e)}", "ERROR")
-        raise
-
-def save_tokens(tokens):
-    token_path = config["stork"].get("tokenPath")
-    try:
-        with open(token_path, "w", encoding="utf-8") as f:
-            json.dump(tokens, f, indent=2)
-        log("Tokens saved successfully")
-        return True
-    except Exception as e:
-        log(f"Error saving tokens: {str(e)}", "ERROR")
-        return False
-
-def refresh_tokens(refresh_token):
-    try:
-        log("Refreshing access token via Stork API...")
-        url = f"{config['stork'].get('authURL')}/refresh"
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": config["stork"].get("userAgent"),
-            "Origin": config["stork"].get("origin")
-        }
-        data = {"refresh_token": refresh_token}
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
-        resp_json = response.json()
-        tokens = {
-            "accessToken": resp_json.get("access_token"),
-            "idToken": resp_json.get("id_token", ""),
-            "refreshToken": resp_json.get("refresh_token", refresh_token),
-            "isAuthenticated": True,
-            "isVerifying": False
-        }
-        save_tokens(tokens)
-        log("Token refreshed successfully via Stork API")
-        return tokens
-    except Exception as e:
-        log(f"Token refresh failed: {str(e)}", "ERROR")
-        raise
-
 # --- API Calls ---
 
-def get_signed_prices(tokens):
+def get_signed_prices(access_token):
     try:
         log("Fetching signed prices data...")
-        url = f"{config['stork'].get('baseURL')}/stork_signed_prices"
+        url = f"{config['stork']['baseURL']}/stork_signed_prices"
         headers = {
-            "Authorization": f"Bearer {tokens.get('accessToken')}",
+            "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "Origin": config["stork"].get("origin"),
-            "User-Agent": config["stork"].get("userAgent")
+            "Origin": config["stork"]["origin"],
+            "User-Agent": config["stork"]["userAgent"]
         }
         response = requests.get(url, headers=headers)
         response.raise_for_status()
@@ -292,15 +176,15 @@ def get_signed_prices(tokens):
         log(f"Error getting signed prices: {str(e)}", "ERROR")
         raise
 
-def send_validation(tokens, msg_hash, is_valid, proxy):
+def send_validation(access_token, msg_hash, is_valid, proxy):
     try:
         agent = get_proxy_dict(proxy)
-        url = f"{config['stork'].get('baseURL')}/stork_signed_prices/validations"
+        url = f"{config['stork']['baseURL']}/stork_signed_prices/validations"
         headers = {
-            "Authorization": f"Bearer {tokens.get('accessToken')}",
+            "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "Origin": config["stork"].get("origin"),
-            "User-Agent": config["stork"].get("userAgent")
+            "Origin": config["stork"]["origin"],
+            "User-Agent": config["stork"]["userAgent"]
         }
         data = {"msg_hash": msg_hash, "valid": is_valid}
         response = requests.post(url, headers=headers, json=data, proxies=agent)
@@ -311,15 +195,15 @@ def send_validation(tokens, msg_hash, is_valid, proxy):
         log(f"✗ Validation failed for {msg_hash[:10]}...: {str(e)}", "ERROR")
         raise
 
-def get_user_stats(tokens):
+def get_user_stats(access_token):
     try:
         log("Fetching user stats...")
-        url = f"{config['stork'].get('baseURL')}/me"
+        url = f"{config['stork']['baseURL']}/me"
         headers = {
-            "Authorization": f"Bearer {tokens.get('accessToken')}",
+            "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
-            "Origin": config["stork"].get("origin"),
-            "User-Agent": config["stork"].get("userAgent")
+            "Origin": config["stork"]["origin"],
+            "User-Agent": config["stork"]["userAgent"]
         }
         response = requests.get(url, headers=headers)
         response.raise_for_status()
@@ -348,47 +232,38 @@ def validate_price(price_data):
         log(f"Validation error: {str(e)}", "ERROR")
         return False
 
-# --- Worker Function ---
-
-def validate_and_send(price_data, tokens, proxy):
+def validate_and_send(price_data, access_token, proxy):
     try:
         is_valid = validate_price(price_data)
-        send_validation(tokens, price_data["msg_hash"], is_valid, proxy)
+        send_validation(access_token, price_data["msg_hash"], is_valid, proxy)
         return {"success": True, "msgHash": price_data["msg_hash"], "isValid": is_valid}
     except Exception as e:
         return {"success": False, "error": str(e), "msgHash": price_data.get("msg_hash")}
-
-# --- Main Validation Process ---
 
 previous_stats = {"validCount": 0, "invalidCount": 0}
 
 def run_validation_process(token_manager):
     try:
         log("--------- STARTING VALIDATION PROCESS ---------")
-        tokens = get_tokens()
-        initial_user_data = get_user_stats(tokens)
+        access_token = token_manager.get_valid_token()
+        initial_user_data = get_user_stats(access_token)
         if not initial_user_data or "stats" not in initial_user_data:
             raise Exception("Could not fetch initial user stats")
         initial_valid_count = initial_user_data["stats"].get("stork_signed_prices_valid_count", 0)
         initial_invalid_count = initial_user_data["stats"].get("stork_signed_prices_invalid_count", 0)
-
         global previous_stats
         if previous_stats["validCount"] == 0 and previous_stats["invalidCount"] == 0:
             previous_stats["validCount"] = initial_valid_count
             previous_stats["invalidCount"] = initial_invalid_count
-
-        signed_prices = get_signed_prices(tokens)
+        signed_prices = get_signed_prices(access_token)
         proxies = load_proxies()
-
         if not signed_prices or len(signed_prices) == 0:
             log("No data to validate")
-            user_data = get_user_stats(tokens)
+            user_data = get_user_stats(access_token)
             display_stats(user_data)
             return
-
         max_workers = config["threads"].get("maxWorkers", 10)
         log(f"Processing {len(signed_prices)} data points with {max_workers} workers...")
-
         chunk_size = math.ceil(len(signed_prices) / max_workers)
         batches = [signed_prices[i:i+chunk_size] for i in range(0, len(signed_prices), chunk_size)]
         results = []
@@ -397,22 +272,18 @@ def run_validation_process(token_manager):
             for i, batch in enumerate(batches):
                 proxy = proxies[i % len(proxies)] if proxies else None
                 for price_data in batch:
-                    futures.append(executor.submit(validate_and_send, price_data, tokens, proxy))
+                    futures.append(executor.submit(validate_and_send, price_data, access_token, proxy))
             for future in concurrent.futures.as_completed(futures):
                 results.append(future.result())
-
         success_count = sum(1 for r in results if r.get("success"))
         log(f"Processed {success_count}/{len(results)} validations successfully")
-
-        updated_user_data = get_user_stats(tokens)
+        updated_user_data = get_user_stats(access_token)
         new_valid_count = updated_user_data["stats"].get("stork_signed_prices_valid_count", 0)
         new_invalid_count = updated_user_data["stats"].get("stork_signed_prices_invalid_count", 0)
         actual_valid_increase = new_valid_count - previous_stats["validCount"]
         actual_invalid_increase = new_invalid_count - previous_stats["invalidCount"]
-
         previous_stats["validCount"] = new_valid_count
         previous_stats["invalidCount"] = new_invalid_count
-
         display_stats(updated_user_data)
         log("--------- VALIDATION SUMMARY ---------")
         log(f"Total data processed: {actual_valid_increase + actual_invalid_increase}")
@@ -447,42 +318,24 @@ def display_stats(user_data):
     print(f"Next validation in {config['stork'].get('intervalSeconds', 10)} seconds...")
     print("=============================================")
 
-# --- Main Application Loop ---
-
 def main():
-    if not validate_config():
+    # Ensure the Firebase API key is set.
+    if not config.get("firebase", {}).get("apiKey"):
+        log("ERROR: Please set your Firebase API key in the configuration.", "ERROR")
         exit(1)
-    # Load tokens from token.json
     token_manager = TokenManager()
     try:
         token_manager.get_valid_token()
-        log("Initial token load successful")
+        log("Initial authentication successful")
     except Exception as e:
         log(f"Application failed to start: {str(e)}", "ERROR")
         exit(1)
-
-    # Start the periodic validation process in a background thread
     def validation_loop():
         while True:
             run_validation_process(token_manager)
             time.sleep(config["stork"].get("intervalSeconds", 10))
     validation_thread = threading.Thread(target=validation_loop, daemon=True)
     validation_thread.start()
-
-    # Optional: Token refresh every 50 minutes (if you wish to use the refresh endpoint)
-    def token_refresh_loop():
-        while True:
-            time.sleep(50 * 60)
-            try:
-                # You can call refresh_tokens() if needed.
-                token_manager.get_valid_token()
-                log("Token refreshed via Cognito")
-            except Exception as e:
-                log(f"Token refresh error: {str(e)}", "ERROR")
-    refresh_thread = threading.Thread(target=token_refresh_loop, daemon=True)
-    refresh_thread.start()
-
-    # Keep the main thread alive.
     while True:
         time.sleep(1)
 
